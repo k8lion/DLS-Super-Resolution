@@ -142,7 +142,7 @@ class SuperRes4x(nn.Module):
     def forward(self, x):
         upblock = True
         # Downsizing layer - Large Kernel ensures large receptive field on the residual blocks
-        h = F.relu(self.b2(self.c1(torch.tensor(x).float())))
+        h = F.relu(self.b2(self.c1(x)))
 
         # Residual Layers
         for r in self.rs:
@@ -158,10 +158,10 @@ class SuperRes4x(nn.Module):
             h = F.relu(self.bc3(self.dc3(h)))
 
         # Last layer and scaled tanh activation - Scaled from 0 to 1 instead of 0 - 255
-        h = F.tanh(self.c3(h))
+        h = nn.Tanh()(self.c3(h))
         h = torch.add(h, 1.)
         h = torch.mul(h, 0.5*255)
-        return transforms.ToPILImage()(h.select(0,0))
+        return h
 
 class SuperResolver(torch.nn.Module):
     def __init__(self):
@@ -175,9 +175,7 @@ class SuperResolver(torch.nn.Module):
         )
 
     def forward(self, img):
-        t = transforms.ToTensor()(img).unsqueeze(0)
-        x = self.superresolver(t)
-        return transforms.ToPILImage()(x.select(0,0))
+        return self.superresolver(img)
 
 
 class SuperResST(torch.nn.Module):
@@ -237,16 +235,13 @@ class SuperResST(torch.nn.Module):
 
 
     def forward(self, x):
-        x = transforms.ToTensor()(x).unsqueeze(0)
         a = self.d_block3(x)
         b = self.residual_in(x)
         x = a + b
         x = self.d_up_conv2(x)
         x = self.d_up_conv3(x)
         x = self.d_block4(x) + self.residual_out(x)
-        x = self.d_block5(x)
-
-        return transforms.ToPILImage()(x.select(0,0))
+        return self.d_block5(x)
 
 class SuperResST8(torch.nn.Module):
     def __init__(self):
@@ -319,7 +314,6 @@ class SuperResST8(torch.nn.Module):
 
 
     def forward(self, x):
-        x = transforms.ToTensor()(x).unsqueeze(0)
         a = self.d_block3(x)
         b = self.residual_in(x)
         x = a + b
@@ -328,8 +322,7 @@ class SuperResST8(torch.nn.Module):
         x = self.d_up_conv4(x)
         x = self.d_block4(x) + self.residual_out(x)
         x = self.d_block5(x)
-        x = self.down_sample(x)
-        return transforms.ToPILImage()(x.select(0,0))
+        return self.down_sample(x)
 
 
 import math
@@ -362,7 +355,6 @@ class Generator(nn.Module):
         self.block8 = nn.Sequential(*block8)
 
     def forward(self, x):
-        x = transforms.ToTensor()(x).unsqueeze(0)
         block1 = self.block1(x)
         block2 = self.block2(block1)
         block3 = self.block3(block2)
@@ -372,7 +364,7 @@ class Generator(nn.Module):
         block7 = self.block7(block6)
         block8 = self.block8(block1 + block7)
         x =  (nn.Tanh()(block8) + 1) / 2
-        return transforms.ToPILImage()(x.select(0,0))
+        return x
 
 
 
@@ -407,3 +399,101 @@ class UpsampleBlock(nn.Module):
         x = self.pixel_shuffle(x)
         x = self.prelu(x)
         return x
+
+import functools
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+
+
+def make_layer(block, n_layers):
+    layers = []
+    for _ in range(n_layers):
+        layers.append(block())
+    return nn.Sequential(*layers)
+
+
+class ResidualDenseBlock_5C(nn.Module):
+    def __init__(self, nf=64, gc=32, bias=True):
+        super(ResidualDenseBlock_5C, self).__init__()
+        # gc: growth channel, i.e. intermediate channels
+        self.conv1 = nn.Conv2d(nf, gc, 3, 1, 1, bias=bias)
+        self.conv2 = nn.Conv2d(nf + gc, gc, 3, 1, 1, bias=bias)
+        self.conv3 = nn.Conv2d(nf + 2 * gc, gc, 3, 1, 1, bias=bias)
+        self.conv4 = nn.Conv2d(nf + 3 * gc, gc, 3, 1, 1, bias=bias)
+        self.conv5 = nn.Conv2d(nf + 4 * gc, nf, 3, 1, 1, bias=bias)
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+        # initialization
+        # mutil.initialize_weights([self.conv1, self.conv2, self.conv3, self.conv4, self.conv5], 0.1)
+
+    def forward(self, x):
+        x1 = self.lrelu(self.conv1(x))
+        x2 = self.lrelu(self.conv2(torch.cat((x, x1), 1)))
+        x3 = self.lrelu(self.conv3(torch.cat((x, x1, x2), 1)))
+        x4 = self.lrelu(self.conv4(torch.cat((x, x1, x2, x3), 1)))
+        x5 = self.conv5(torch.cat((x, x1, x2, x3, x4), 1))
+        return x5 * 0.2 + x
+
+import numpy as np
+class RRDB(nn.Module):
+    '''Residual in Residual Dense Block'''
+
+    def __init__(self, nf, gc=32):
+        super(RRDB, self).__init__()
+        self.RDB1 = ResidualDenseBlock_5C(nf, gc)
+        self.RDB2 = ResidualDenseBlock_5C(nf, gc)
+        self.RDB3 = ResidualDenseBlock_5C(nf, gc)
+
+    def forward(self, x):
+        out = self.RDB1(x)
+        out = self.RDB2(out)
+        out = self.RDB3(out)
+        return out * 0.2 + x
+
+class RRDBNet(nn.Module):
+    def __init__(self, in_nc, out_nc, nf, nb, gc=32):
+        super(RRDBNet, self).__init__()
+        RRDB_block_f = functools.partial(RRDB, nf=nf, gc=gc)
+
+        self.conv_first = nn.Conv2d(in_nc, nf, 3, 1, 1, bias=True)
+        self.RRDB_trunk = make_layer(RRDB_block_f, nb)
+        self.trunk_conv = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        #### upsampling
+        self.upconv1 = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.upconv2 = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.HRconv = nn.Conv2d(nf, nf, 3, 1, 1, bias=True)
+        self.conv_last = nn.Conv2d(nf, out_nc, 3, 1, 1, bias=True)
+
+        self.lrelu = nn.LeakyReLU(negative_slope=0.2, inplace=True)
+
+
+
+    def forward(self, x):
+        '''
+        summed = list()
+        for s in np.arange(0.5, 2.0, 0.5):
+            scaled = F.interpolate(x, scale_factor=2**s, mode='bicubic', align_corners=False)
+            fea = self.conv_first(scaled)
+            trunk = self.trunk_conv(self.RRDB_trunk(fea))
+            fea = fea + trunk
+
+            fea = self.lrelu(self.upconv1(F.interpolate(fea, scale_factor=2, mode='nearest')))
+            fea = self.lrelu(self.upconv2(F.interpolate(fea, scale_factor=2, mode='nearest')))
+            out = self.conv_last(self.lrelu(self.HRconv(fea)))
+            out = F.interpolate(out, size=256, mode='bicubic', align_corners=False)
+            summed.append(out)
+        out = torch.mean(torch.stack(summed), dim=0)
+        output = out.data
+        output = output.float().cpu().clamp_(0, 1)
+        return output
+        '''
+        fea = self.conv_first(x)
+        trunk = self.trunk_conv(self.RRDB_trunk(fea))
+        fea = fea + trunk
+        fea = self.lrelu(self.upconv1(F.interpolate(fea, scale_factor=2, mode='nearest')))
+        fea = self.lrelu(self.upconv2(F.interpolate(fea, scale_factor=2, mode='nearest')))
+        out = self.conv_last(self.lrelu(self.HRconv(fea)))
+        output = out.data
+        output = output.float().cpu().clamp_(0, 1)
+        return output
